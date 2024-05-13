@@ -1,5 +1,6 @@
 import socket
 import pickle
+import threading
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
@@ -25,8 +26,31 @@ class Server:
         self.socket.bind((self.host, self.port))
         self.socket.listen(5)
         print(f"Server listening on {self.host}:{self.port}")
+        #while True:
+        #    client_socket, _ = self.socket.accept()
+        #    client = ClientConnection(client_socket, self.server_private_key, self.server_public_key)
+        #    self.clients.append(client)
+        #    client.start()
+
+        # Separate thread for each client connection
+        conn_thread = threading.Thread(target=self.thread_client, daemon=True)
+        conn_thread.start()
+        
         while True:
-            client_socket, _ = self.socket.accept()
+            cmd = input("Enter 'exit' to close server\n")
+            if cmd == "exit":
+                print("Closing server")
+                self.socket.close()
+                print(self.socket)
+                return
+
+    def thread_client(self):
+        while True:
+            try:
+                client_socket, _ = self.socket.accept()
+            except Exception as e:
+                print("Closed socket")
+                break
             client = ClientConnection(client_socket, self.server_private_key, self.server_public_key)
             self.clients.append(client)
             client.start()
