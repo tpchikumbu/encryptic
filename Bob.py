@@ -1,148 +1,122 @@
 import socket
-import os
-import datetime
-from cryptography import x509
-from cryptography.hazmat.primitives.asymmetric import rsa, dh
-from cryptography.hazmat.primitives import serialization, hashes, padding
+import threading
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.backends import default_backend
-import zlib
+from cryptography.hazmat.primitives.asymmetric import dh
+from cryptography.fernet import Fernet
+import base64
+import os
 
-from Alice import alice_public_key
-from generate_ca import ca_private_key
-
-# Load CA's public key and certificate
-with open("ca_public_key.pem", "rb") as f:
-    ca_public_key = serialization.load_pem_public_key(f.read(), backend=default_backend())
-
-with open("ca_cert.pem", "rb") as f:
-    ca_cert = x509.load_pem_x509_certificate(f.read(), backend=default_backend())
-
-# Generate Bob's private key and certificate
-bob_private_key = rsa.generate_private_key(
-    public_exponent=65537,
-    key_size=2048,
-    backend=default_backend()
-)
-bob_public_key = bob_private_key.public_key()
-
-# Create a certificate for Bob signed by the CA
-subject = issuer = x509.Name([
-    x509.NameAttribute(x509.oid.NameOID.COUNTRY_NAME, u"US"),
-    x509.NameAttribute(x509.oid.NameOID.STATE_OR_PROVINCE_NAME, u"California"),
-    x509.NameAttribute(x509.oid.NameOID.LOCALITY_NAME, u"San Francisco"),
-    x509.NameAttribute(x509.oid.NameOID.ORGANIZATION_NAME, u"My Company"),
-    x509.NameAttribute(x509.oid.NameOID.COMMON_NAME, u"Bob"),
-])
-cert = x509.CertificateBuilder().subject_name(
-    subject
-).issuer_name(
-    issuer
-).public_key(
-    bob_public_key
-).serial_number(
-    x509.random_serial_number()
-).not_valid_before(
-    datetime.datetime.utcnow()
-).not_valid_after(
-    datetime.datetime.utcnow() + datetime.timedelta(days=365)
-).add_extension(
-    x509.SubjectAlternativeName([x509.IPAddress(socket.gethostbyname("localhost"))]),
-    critical=False,
-).sign(ca_private_key, hashes.SHA256(), default_backend())
-
-bob_cert = cert.public_bytes(serialization.Encoding.PEM)
-
-# Start the server
-server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server_socket.bind(("localhost", 12345))
-server_socket.listen(1)
-print("Server listening on localhost:12345")
-
-# Accept a connection from Alice
-client_socket, _ = server_socket.accept()
-
-# Exchange certificates and verify
-alice_cert_bytes = client_socket.recv(4096)
-alice_cert = x509.load_pem_x509_certificate(alice_cert_bytes, backend=default_backend())
-
-# Verify Alice's certificate
-try:
-    ca_public_key.verify(
-        alice_cert.signature,
-        alice_cert.tbs_certificate_bytes,
-        padding.PKCS1v15(),
-        alice_cert.signature_hash_algorithm,
+# Key generation functions
+def generate_rsa_key_pair():
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
     )
-except ValueError:
-    print("Alice's certificate is not valid!")
-    exit(1)
+    public_key = private_key.public_key()
+    return private_key, public_key
 
-# Send Bob's certificate
-client_socket.send(bob_cert)
-
-# Perform Diffie-Hellman key exchange
-bob_dh_parameters = dh.generate_parameters(generator=2, key_size=2048, backend=default_backend())
-bob_dh_private_key = bob_dh_parameters.generate_private_key()
-bob_dh_public_key = bob_dh_private_key.public_key().public_bytes(
-    encoding=serialization.Encoding.PEM,
-    format=serialization.PublicFormat.SubjectPublicKeyInfo
-)
-alice_dh_public_key = client_socket.recv(4096)
-shared_key = bob_dh_private_key.exchange(serialization.load_pem_public_key(alice_dh_public_key, backend=default_backend()))
-
-# Derive AES key from shared key
-hkdf = HKDF(
-    algorithm=hashes.SHA256(),
-    length=32,
-    salt=None,
-    info=b'',
-    backend=default_backend()
-)
-aes_key = hkdf.derive(shared_key)
-
-# Receive the encrypted message and digest
-encrypted_message = client_socket.recv(4096)
-print("Received Encrypted Message:", encrypted_message)
-encrypted_digest = client_socket.recv(4096)
-print("Received Encrypted Digest:", encrypted_digest)
-
-# Decrypt the message
-cipher = Cipher(algorithms.AES(aes_key), modes.CBC(b'\x00' * 16), backend=default_backend())
-decryptor = cipher.decryptor()
-compressed_message = decryptor.update(encrypted_message) + decryptor.finalize()
-print("Decrypted (Compressed) Message:", compressed_message)
-
-# Verify the message integrity
-message_digest = alice_public_key.decrypt(
-    encrypted_digest,
-    padding.OAEP(
-        mgf=padding.MGF1(algorithm=hashes.SHA256()),
-        algorithm=hashes.SHA256(),
-        label=None
+def save_private_key(private_key, filename):
+    pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
     )
-)
-print("Decrypted Digest (SHA-256):", message_digest.hex())
+    with open(filename, 'wb') as f:
+        f.write(pem)
 
-message_hash = hashes.Hash(hashes.SHA256(), backend=default_backend())
-message_hash.update(compressed_message)
-computed_digest = message_hash.finalize()
-print("Computed Digest (SHA-256):", computed_digest.hex())
+def save_public_key(public_key, filename):
+    pem = public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    with open(filename, 'wb') as f:
+        f.write(pem)
 
-if message_digest != computed_digest:
-    print("Message integrity check failed!")
-    exit(1)
+def load_private_key(filename):
+    with open(filename, 'rb') as f:
+        pem = f.read()
+    private_key = serialization.load_pem_private_key(pem, password=None)
+    return private_key
 
-# Decompress the message
-decompressed_message = zlib.decompress(compressed_message)
-caption, image_data = decompressed_message.split(b"||")
+def load_public_key(filename):
+    with open(filename, 'rb') as f:
+        pem = f.read()
+    public_key = serialization.load_pem_public_key(pem)
+    return public_key
 
-# Save the image and display the caption
-with open("received_image.png", "wb") as f:
-    f.write(image_data)
-print("Caption:", caption.decode())
+# Generate and save keys
+bob_private_key, bob_public_key = generate_rsa_key_pair()
+save_private_key(bob_private_key, 'bob_private_key.pem')
+save_public_key(bob_public_key, 'bob_public_key.pem')
 
-# Close the connection
-client_socket.close()
-server_socket.close()
+# Load Alice's public key (assuming it is saved in 'alice_public_key.pem')
+alice_public_key = load_public_key('alice_public_key.pem')
+
+# Diffie-Hellman key exchange
+parameters = dh.generate_parameters(generator=2, key_size=2048)
+bob_dh_private_key = parameters.generate_private_key()
+bob_dh_public_key = bob_dh_private_key.public_key()
+
+# Networking functions
+def start_client():
+    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client_socket.connect(('localhost', 12345))
+
+    try:
+        # Receive Alice's public key and send Bob's public key
+        alice_public_key_pem = client_socket.recv(1024)
+        alice_public_key = serialization.load_pem_public_key(alice_public_key_pem)
+        client_socket.sendall(bob_public_key.public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+
+        # Send Bob's DH public key and receive Alice's DH public key
+        client_socket.sendall(bob_dh_public_key.public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+        alice_dh_public_key_pem = client_socket.recv(1024)
+        alice_dh_public_key = serialization.load_pem_public_key(alice_dh_public_key_pem)
+
+        # Compute shared key
+        bob_shared_key = bob_dh_private_key.exchange(alice_dh_public_key)
+
+        derived_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b'handshake data',
+        ).derive(bob_shared_key)
+
+        # Create a Fernet key for encryption
+        fernet_key = base64.urlsafe_b64encode(derived_key[:32])
+        cipher = Fernet(fernet_key)
+
+        # Receive and decrypt a message
+        encrypted_message = client_socket.recv(1024)
+        decrypted_message = cipher.decrypt(encrypted_message)
+        print("Decrypted message from Alice:", decrypted_message.decode())
+
+        # Encrypt and send a message
+        message = "Hello from Bob"
+        encrypted_message = cipher.encrypt(message.encode())
+        client_socket.sendall(encrypted_message)
+
+        # Receive and send an image
+        encrypted_image_data = client_socket.recv(10240)
+        decrypted_image_data = cipher.decrypt(encrypted_image_data)
+        with open("received_image.png", "wb") as image_file:
+            image_file.write(decrypted_image_data)
+
+        with open("image_to_send.png", "rb") as image_file:
+            image_data = image_file.read()
+        encrypted_image_data = cipher.encrypt(image_data)
+        client_socket.sendall(encrypted_image_data)
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+    finally:
+        client_socket.close()
+
+# Start the client
+client_thread = threading.Thread(target=start_client)
+client_thread.start()
+client_thread.join()
